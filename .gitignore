@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Local vector database (regenerated at runtime, don't share/version)
+chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Editor/OS
+.DS_Store
+.vscode/
