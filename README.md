@@ -26,14 +26,14 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-streamlit run Microeai_RAG.py
+streamlit run Microeai_RAG_v2.py
 ```
 
 This opens the app in your browser. Upload one or more `.docx` files in the sidebar, then ask questions in the chat box.
 
 ## Configuration (optional)
 
-The app works out of the box with sensible defaults. To override any of them, set environment variables before running — see the top of `Microeai_RAG.py` for the full list (chunk size, retrieval settings, LLM temperature/context window, etc.).
+The app works out of the box with sensible defaults. To override any of them, set environment variables before running — see the top of `Microeai_RAG_v2.py` for the full list (chunk size, retrieval settings, LLM temperature/context window, etc.).
 
 ## Notes
 

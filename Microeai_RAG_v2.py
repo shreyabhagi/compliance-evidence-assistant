@@ -31,7 +31,7 @@ LANGUAGE_MODEL = os.environ.get(
 )
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1100"))  # Max characters per text chunk.
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "180"))  # Overlap between consecutive chunks so information isn't lost at chunk boundaries.
-DOCUMENT_PREVIEW_LENGTH = int(os.environ.get("DOCUMENT_PREVIEW_LENGTH", "1500"))  # Length of the leading excerpt embedded per document, used to answer document-level/overview questions.
+DOCUMENT_PREVIEW_LENGTH = int(os.environ.get("DOCUMENT_PREVIEW_LENGTH", "1500"))  # Size of the representative sample (beginning/headings/middle/end) embedded per document, used for document selection.
 RETRIEVE_TOP_N = int(os.environ.get("RETRIEVE_TOP_N", "6"))  # Final number of evidence chunks handed to the LLM to answer with.
 RETRIEVE_CANDIDATE_N = int(os.environ.get("RETRIEVE_CANDIDATE_N", "18"))  # Larger candidate pool retrieved before re-ranking down to RETRIEVE_TOP_N.
 DOC_SELECT_TOP_N = int(os.environ.get("DOC_SELECT_TOP_N", "3"))  # Number of most-relevant documents to consider per query.
@@ -254,6 +254,79 @@ def chunk_text_by_section(full_text: str) -> list[TextChunk]:
 
     return chunks
 
+
+# Builds ONE representative text sample for the document-level embedding: beginning + section headings
+# + middle + end, so content late in a long document still influences document selection.
+def build_document_embedding_text(full_text: str, budget: int = DOCUMENT_PREVIEW_LENGTH) -> str:
+    if len(full_text) <= budget:
+        return full_text
+
+    headings = [title for title, _ in split_into_sections(full_text) if title != "Document overview"]
+    heading_text = ("Sections: " + "; ".join(dict.fromkeys(headings)))[: budget // 5] if headings else ""
+
+    remaining = budget - len(heading_text)
+    head_len = int(remaining * 0.4)
+    middle_len = int(remaining * 0.3)
+    tail_len = remaining - head_len - middle_len
+    middle_start = max(head_len, (len(full_text) - middle_len) // 2)
+
+    parts = [
+        full_text[:head_len],
+        heading_text,
+        full_text[middle_start: middle_start + middle_len],
+        full_text[-tail_len:],
+    ]
+    return "\n...\n".join(part for part in parts if part)
+
+
+# Title/heading phrases that identify a document type from its content. Checked in this order, because
+# SAE reports and narratives often mention a protocol number and would otherwise look like protocols.
+DOCUMENT_TYPE_CONTENT_PATTERNS = (
+    ("sae_report", ("serious adverse event report", "sae report", "sae form", "sae number", "sae id")),
+    ("trial_narrative", ("patient narrative", "subject narrative", "case narrative", "clinical narrative", "safety narrative")),
+    ("clinical_trial_protocol", ("clinical trial protocol", "clinical study protocol", "study protocol", "protocol synopsis", "protocol number", "protocol title")),
+    ("sop", ("standard operating procedure", "sop number", "sop no")),
+    ("audit_report", ("audit report", "audit findings", "audit scope", "audit observation")),
+    ("risk_document", ("risk assessment", "risk register", "risk management plan")),
+    ("policy", ("policy statement", "policy owner", "policy purpose", "policy scope")),
+)
+# Filename fallback — the keywords apply_query_source_scope has always relied on.
+DOCUMENT_TYPE_FILENAME_KEYWORDS = (
+    ("sae_report", ("sae",)),
+    ("trial_narrative", ("narrative",)),
+    ("clinical_trial_protocol", ("protocol",)),
+    ("sop", ("sop", "procedure")),
+    ("audit_report", ("audit",)),
+    ("risk_document", ("risk",)),
+    ("policy", ("policy",)),
+)
+
+
+# Deterministic document-type guess from the title, opening text and headings; filename is only a fallback.
+def infer_document_type(source_name: str, full_text: str) -> str:
+    lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+    title = lines[0].lower() if lines else ""
+    headings = " ".join(title for title, _ in split_into_sections(full_text[:5000])).lower()
+    opening = f"{full_text[:1500].lower()} {headings}"
+
+    for doc_type, phrases in DOCUMENT_TYPE_CONTENT_PATTERNS:
+        if any(phrase in title for phrase in phrases):
+            return doc_type
+
+    hits = {
+        doc_type: sum(1 for phrase in phrases if phrase in opening)
+        for doc_type, phrases in DOCUMENT_TYPE_CONTENT_PATTERNS
+    }
+    best_type = max(hits, key=lambda doc_type: hits[doc_type])  # ties keep the earlier (priority) type
+    if hits[best_type] > 0:
+        return best_type
+
+    name_lower = source_name.lower()
+    for doc_type, keywords in DOCUMENT_TYPE_FILENAME_KEYWORDS:
+        if any(keyword in name_lower for keyword in keywords):
+            return doc_type
+    return "other"
+
 # Checks what fraction of the question's important words show up in the text
 def keyword_score(query: str, text: str) -> float:
     query_terms = {
@@ -340,8 +413,14 @@ def count_session_chunks(session_id: str) -> int:
         logger.warning("Could not count session chunks for '%s': %s", session_id, e)
         return 0
 
-# Narrows the search down to documents whose filenames match keywords in the question
-def apply_query_source_scope(query: str, available_sources: list[str], selected_sources: list[str]) -> list[str]:
+# Narrows the search down to documents whose filenames (or, when available, document_type metadata)
+# match keywords in the question
+def apply_query_source_scope(
+    query: str,
+    available_sources: list[str],
+    selected_sources: list[str],
+    document_types: dict[str, str] | None = None,
+) -> list[str]:
     query_lower = query.lower()
     source_lower = {source: source.lower() for source in available_sources}
 
@@ -350,23 +429,31 @@ def apply_query_source_scope(query: str, available_sources: list[str], selected_
         return selected_sources or available_sources
 
     scoped_sources: list[str] = []
+    scope_type = None
     if "protocol" in query_lower:
+        scope_type = "clinical_trial_protocol"
         scoped_sources = [source for source, lowered in source_lower.items() if "protocol" in lowered]
     elif "investigator observation" in query_lower or "investigator observations" in query_lower:
+        scope_type = "trial_narrative"
         scoped_sources = [source for source, lowered in source_lower.items() if "narrative" in lowered]
     elif "narrative" in query_lower:
+        scope_type = "trial_narrative"
         scoped_sources = [source for source, lowered in source_lower.items() if "narrative" in lowered]
     elif "sae" in query_lower or "serious adverse event" in query_lower:
+        scope_type = "sae_report"
         scoped_sources = [source for source, lowered in source_lower.items() if "sae" in lowered]
     elif "policy" in query_lower:
+        scope_type = "policy"
         scoped_sources = [source for source, lowered in source_lower.items() if "policy" in lowered]
     elif "sop" in query_lower or "procedure" in query_lower:
+        scope_type = "sop"
         scoped_sources = [
             source
             for source, lowered in source_lower.items()
             if "sop" in lowered or "procedure" in lowered
         ]
     elif "audit" in query_lower or "finding" in query_lower:
+        scope_type = "audit_report"
         scoped_sources = [
             source
             for source, lowered in source_lower.items()
@@ -381,12 +468,22 @@ def apply_query_source_scope(query: str, available_sources: list[str], selected_
             if "incident" in lowered or "breach" in lowered
         ]
     elif "risk" in query_lower:
+        scope_type = "risk_document"
         scoped_sources = [source for source, lowered in source_lower.items() if "risk" in lowered]
     elif "regulatory" in query_lower or "filing" in query_lower or "submission" in query_lower:
         scoped_sources = [
             source
             for source, lowered in source_lower.items()
             if "regulatory" in lowered or "filing" in lowered or "submission" in lowered
+        ]
+
+    # Metadata matches are added to (never replace) filename matches, so recall cannot drop.
+    if scope_type and document_types:
+        scoped_set = set(scoped_sources)
+        scoped_sources = [
+            source
+            for source in available_sources
+            if source in scoped_set or document_types.get(source) == scope_type
         ]
 
     if scoped_sources:
@@ -396,6 +493,8 @@ def apply_query_source_scope(query: str, available_sources: list[str], selected_
     return selected_sources or available_sources
 
 # Session ID tags every document/chunk written to ChromaDB so sessions never see each other's documents.
+# TODO: session_id is prototype-level isolation only. A production deployment needs authorization-backed
+# tenant filtering (e.g. organization/project/user IDs derived from an authenticated identity).
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
 session_id = st.session_state.session_id
@@ -500,6 +599,34 @@ def get_indexed_document_metadata(source_name: str, session_id: str) -> dict | N
     return None
 
 
+# True only if a previous indexing run finished every chunk for this exact content.
+# Metadata from older app versions (no index_status) is deliberately not trusted.
+def is_index_complete(existing_meta: dict | None, doc_hash: str) -> bool:
+    if not existing_meta or existing_meta.get("doc_hash") != doc_hash:
+        return False
+    if existing_meta.get("index_status") != "COMPLETE":
+        return False
+    expected = existing_meta.get("expected_chunk_count")
+    persisted = existing_meta.get("persisted_chunk_count")
+    if expected is not None and persisted is not None and persisted != expected:
+        return False
+    return True
+
+
+# Maps each of this session's documents to its stored document_type (metadata lookup only, no vector search)
+def get_session_document_types(session_id: str) -> dict[str, str]:
+    try:
+        result = docs_collection.get(where={"session_id": session_id}, include=["metadatas"])
+        return {
+            meta["source"]: meta["document_type"]
+            for meta in result["metadatas"]
+            if meta and meta.get("document_type")
+        }
+    except Exception as e:
+        logger.warning("Could not load document types for session '%s': %s", session_id, e)
+        return {}
+
+
 # Deletes a document and all its chunks from ChromaDB
 def clear_document_from_index(source_name: str, session_id: str) -> None:
     doc_id = f"{session_id}::{source_name}"
@@ -531,44 +658,60 @@ def load_and_index_docx(filename, session_id: str) -> None:
 
     doc_hash = document_fingerprint(full_text)
     existing_meta = get_indexed_document_metadata(source_name, session_id)
-    if existing_meta and existing_meta.get("doc_hash") == doc_hash:
+    if is_index_complete(existing_meta, doc_hash):
         logger.info("'%s' already indexed for this session — skipping re-embedding.", source_name)
         document_texts[source_name] = full_text
         return
-    if existing_meta:
+    if existing_meta and existing_meta.get("doc_hash") == doc_hash:
+        logger.info(
+            "'%s' has an incomplete index (status=%s) — rebuilding embeddings.",
+            source_name, existing_meta.get("index_status", "unknown"),
+        )
+    elif existing_meta:
         logger.info("'%s' changed since last indexing — rebuilding embeddings.", source_name)
-        clear_document_from_index(source_name, session_id)
+    # Always clear before (re)building so partial or stale chunks from an interrupted run cannot linger.
+    clear_document_from_index(source_name, session_id)
 
     document_texts[source_name] = full_text
     logger.info("Loaded '%s' (%d characters).", source_name, len(full_text))
 
-    # Document-level embedding (used by choose_relevant_documents)
-    preview = full_text[:DOCUMENT_PREVIEW_LENGTH]
+    # Split into section-aware chunks first, then embed in batches.
+    chunks = chunk_text_by_section(full_text)
+    chunk_texts = [chunk.text for chunk in chunks]
+    document_type = infer_document_type(source_name, full_text)
+
+    doc_id = f"{session_id}::{source_name}"
+    doc_meta = {
+        "source": source_name,
+        "session_id": session_id,
+        "doc_hash": doc_hash,
+        "character_count": len(full_text),
+        "app_version": APP_VERSION,
+        "document_type": document_type,
+        "index_status": "PENDING",
+        "expected_chunk_count": len(chunks),
+        "persisted_chunk_count": 0,
+    }
+
+    # Document-level embedding (used by choose_relevant_documents), stored as PENDING until all chunks persist.
+    preview = build_document_embedding_text(full_text)
+    doc_stored = False
     try:
         doc_embedding = get_embedding(preview)
-        docs_collection.add(
-            ids=[f"{session_id}::{source_name}"],
+        docs_collection.upsert(
+            ids=[doc_id],
             documents=[preview],
             embeddings=[doc_embedding],
-            metadatas=[{
-                "source": source_name,
-                "session_id": session_id,
-                "doc_hash": doc_hash,
-                "character_count": len(full_text),
-                "app_version": APP_VERSION,
-            }],
+            metadatas=[doc_meta],
         )
-        logger.info("Document-level embedding stored for '%s'.", source_name)
+        doc_stored = True
+        logger.info("Document-level embedding stored for '%s' (status PENDING).", source_name)
     except Exception as e:
         logger.error("Failed to store document-level embedding for '%s': %s", source_name, e)
         st.warning(f"Could not create document embedding for '{source_name}': {e}")
 
-    # Split into section-aware chunks first, then embed in batches.
-    chunks = chunk_text_by_section(full_text)
-    chunk_texts = [chunk.text for chunk in chunks]
-
-    batch: dict[str, list] = {"ids": [], "documents": [], "embeddings": [], "metadatas": []}
     failed = 0
+    persisted = 0
 
     with st.spinner(f"Embedding '{source_name}'..."):
         for batch_start in range(0, len(chunk_texts), EMBED_BATCH_SIZE):
@@ -583,6 +726,7 @@ def load_and_index_docx(filename, session_id: str) -> None:
                 )
                 continue
 
+            batch: dict[str, list] = {"ids": [], "documents": [], "embeddings": [], "metadatas": []}
             for offset, (chunk_text, embedding) in enumerate(zip(batch_texts, batch_embeddings)):
                 chunk_index = batch_start + offset
                 chunk = chunks[chunk_index]
@@ -598,19 +742,36 @@ def load_and_index_docx(filename, session_id: str) -> None:
                     "char_start": chunk.char_start,
                     "char_end": chunk.char_end,
                     "app_version": APP_VERSION,
+                    "document_type": document_type,
                 })
-            logger.debug("Embedded chunks %d-%d from '%s'.", batch_start, batch_start + len(batch_texts) - 1, source_name)
 
-    if batch["ids"]:
+            # Persist each successful batch immediately; deterministic IDs + upsert make retries duplicate-free.
+            try:
+                chunks_collection.upsert(**batch)
+                persisted += len(batch["ids"])
+                logger.debug("Stored chunks %d-%d from '%s'.", batch_start, batch_start + len(batch_texts) - 1, source_name)
+            except Exception as e:
+                failed += len(batch["ids"])
+                logger.error("Failed to write chunks %d-%d to ChromaDB for '%s': %s",
+                             batch_start, batch_start + len(batch_texts) - 1, source_name, e)
+
+    logger.info("Stored %d/%d chunks for '%s'.", persisted, len(chunk_texts), source_name)
+
+    # COMPLETE only when every expected chunk is persisted; anything else is retried on the next load.
+    if doc_stored:
+        doc_meta["persisted_chunk_count"] = persisted
+        doc_meta["index_status"] = "COMPLETE" if (failed == 0 and persisted == len(chunks)) else "FAILED"
         try:
-            chunks_collection.add(**batch)
-            logger.info("Stored %d/%d chunks for '%s'.", len(batch["ids"]), len(chunk_texts), source_name)
+            docs_collection.update(ids=[doc_id], metadatas=[doc_meta])
+            logger.info("Index status for '%s': %s.", source_name, doc_meta["index_status"])
         except Exception as e:
-            logger.error("Failed to write chunks to ChromaDB for '%s': %s", source_name, e)
-            st.error(f"Could not save chunks for '{source_name}': {e}")
+            logger.error("Failed to record index status for '%s': %s", source_name, e)
 
     if failed:
-        st.warning(f"{failed} chunk(s) from '{source_name}' could not be embedded and were skipped.")
+        st.warning(
+            f"{failed} chunk(s) from '{source_name}' could not be embedded or saved. "
+            "The document is marked incomplete and will be re-indexed on the next load."
+        )
 
 
 if uploaded_files:
@@ -1042,49 +1203,6 @@ def normalize_inline_citations(response_text: str, valid_sources: set[str]) -> s
     return "".join(output)
 
 
-# If there's only one document, adds its citation to any line that looks like a claim but has no citation yet
-def add_missing_single_source_citations(response_text: str, valid_sources: set[str]) -> str:
-    if len(valid_sources) != 1:
-        return response_text
-
-    source = next(iter(valid_sources))
-    citation = f"(Source: {source})"
-    skip_prefixes = (
-        "sources consulted:",
-        "audit:",
-        "safety-critical/regulatory-action notice:",
-        "high-impact compliance/regulatory-action notice:",
-        "groundedness check",
-        "please verify",
-        "the provided documents do not contain enough information",
-        "this question is outside the scope",
-    )
-
-    lines = []
-    for line in response_text.splitlines():
-        stripped = line.strip()
-        if (
-            not stripped
-            or "Source:" in stripped
-            or stripped.lower().startswith(skip_prefixes)
-            or stripped.endswith(":")
-        ):
-            lines.append(line)
-            continue
-
-        looks_like_claim = (
-            stripped.startswith(("-", "*"))
-            or stripped.endswith((".", ")"))
-            or len(stripped.split()) >= 6
-        )
-        if looks_like_claim and any(char.isalpha() for char in stripped):
-            lines.append(f"{line.rstrip()} {citation}")
-        else:
-            lines.append(line)
-
-    return "\n".join(lines)
-
-
 # Removes internal metadata (chunk numbers, section labels, etc.) that shouldn't show up in the answer
 def strip_metadata_leakage(response_text: str) -> str:
     cleaned = response_text
@@ -1169,7 +1287,8 @@ def remove_repetitive_claims(response_text: str) -> str:
     return "\n".join(lines)
 
 
-# Final cleanup pass: removes filler phrases, duplicate citations, and extra parentheses, and fixes line breaks
+# Final cleanup pass: removes filler phrases and duplicate citations, and fixes line breaks.
+# Parenthetical content (e.g. "(Grade 3)", "(CTCAE)") is kept; the groundedness checks flag unsupported additions instead.
 def polish_final_answer(response_text: str) -> str:
     polished = response_text
     polished = re.sub(
@@ -1201,12 +1320,6 @@ def polish_final_answer(response_text: str) -> str:
         polished,
         flags=re.IGNORECASE,
     )
-    # Drop non-citation parenthetical definitions — high-risk embellishment unless the source states them.
-    polished = re.sub(
-        r"\s+\((?!Source:)[A-Za-z][^()]{2,80}\)",
-        "",
-        polished,
-    )
     polished = re.sub(r"\s+([,.])", r"\1", polished)
     polished = re.sub(r"\n{3,}", "\n\n", polished)
     return polished.strip()
@@ -1233,6 +1346,284 @@ def cap_claim_count(response_text: str, query: str, max_claims: int = 5) -> str:
         capped_lines.append(line)
 
     return "\n".join(capped_lines).strip()
+
+
+# Existing post-processing chain: clean formatting, normalize citations, trim/deduplicate the answer.
+# Deliberately does NOT add citations — an uncited claim stays uncited so the groundedness checks flag it.
+def finalize_answer_text(response_text: str, valid_sources: set[str], query: str) -> str:
+    finalized = strip_metadata_leakage(response_text)
+    finalized = normalize_inline_citations(finalized, valid_sources)
+    finalized = strip_metadata_leakage(finalized)
+    finalized = remove_repetitive_claims(finalized)
+    finalized = normalize_answer_format(finalized)
+    finalized = polish_final_answer(finalized)
+    finalized = cap_claim_count(finalized, query)
+    finalized = normalize_answer_format(
+        remove_repetitive_claims(strip_metadata_leakage(finalized))
+    ).rstrip()
+    finalized = polish_final_answer(finalized)
+    return cap_claim_count(finalized, query)
+
+
+# Lightweight claim-to-evidence validation. Deterministic and lexical: compares each claim's important
+# terms against the chunks ALREADY retrieved for the cited source(s). No LLM call, no embedding, no
+# vector search. Lexical overlap is a cheap signal for obvious unsupported content, not proof of entailment.
+CLAIM_SUPPORT_THRESHOLD = 0.5    # Share of a claim's content words found in cited evidence to accept it.
+CLAIM_MISMATCH_THRESHOLD = 0.25  # Below this, the cited evidence is treated as unrelated to the claim.
+CLAIM_STOPWORDS = frozenset({
+    "that", "this", "with", "from", "were", "have", "been", "which", "their", "there", "they", "will",
+    "would", "should", "shall", "must", "also", "into", "than", "then", "when", "where", "what", "such",
+    "each", "other", "these", "those", "about", "after", "before", "during", "under", "over", "within",
+    "without", "between", "both", "only", "more", "most", "some", "being", "does", "done", "made", "make",
+    "including", "include", "includes", "document", "documents", "source", "sources", "states", "stated",
+    "state", "describes", "described", "according", "provided", "based", "following", "indicates",
+    "indicated", "mentions", "mentioned", "specifies", "specified", "notes", "noted", "while", "there",
+})
+NON_CLAIM_PREFIXES = (
+    "sources consulted:",
+    "audit:",
+    "safety-critical/regulatory-action notice:",
+    "high-impact compliance/regulatory-action notice:",
+    "groundedness check",
+    "please verify",
+    "the provided documents do not contain enough information",
+    "this question is outside the scope",
+)
+
+
+# Splits an answer into claim units: each bullet (with its continuation lines) or standalone line
+def split_answer_into_claims(response_text: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in response_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("-", "*")):
+            if current:
+                blocks.append(" ".join(current))
+            current = [stripped]
+        elif current and stripped:
+            current.append(stripped)
+        else:
+            if current:
+                blocks.append(" ".join(current))
+                current = []
+            if stripped:
+                blocks.append(stripped)
+    if current:
+        blocks.append(" ".join(current))
+
+    claims = []
+    for block in blocks:
+        body = block.lstrip("-*• ").strip()
+        lowered = body.lower()
+        if (
+            lowered.startswith(NON_CLAIM_PREFIXES)
+            or "did not contain relevant information" in lowered
+            or body.endswith(":")
+            or len(re.findall(r"[A-Za-z]{2,}", body)) < 3
+        ):
+            continue
+        claims.append(block)
+    return claims
+
+
+# Splits text into (strong terms, content-word stems). Strong terms are numbers, IDs, dates, grades,
+# percentages and acronyms; content stems are crude 6-char prefixes of non-stopword words.
+def _claim_terms(text: str) -> tuple[set[str], set[str]]:
+    strong: set[str] = set()
+    content: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-/.%:]*", text):
+        token = raw.rstrip(".:/-")
+        if not token:
+            continue
+        if any(ch.isdigit() for ch in token) or (token.isalpha() and token.isupper() and len(token) >= 2):
+            strong.add(token.lower())
+            continue
+        for part in re.split(r"[-/.:]", token):
+            if part.isalpha() and len(part) >= 4 and part.lower() not in CLAIM_STOPWORDS:
+                content.add(part.lower()[:6])
+    return strong, content
+
+
+def _term_in_text(term: str, text_lower: str) -> bool:
+    return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text_lower) is not None
+
+
+# Returns (missing strong terms, content coverage) of a claim against one evidence profile
+def _evidence_overlap(strong: set[str], content: set[str], profile: tuple[str, set[str]]) -> tuple[list[str], float]:
+    text_lower, stems = profile
+    missing = sorted(term for term in strong if not _term_in_text(term, text_lower))
+    coverage = len(content & stems) / len(content) if content else 1.0
+    return missing, coverage
+
+
+# Classifies each claim as SUPPORTED, MISSING_CITATION, CITATION_MISMATCH, POSSIBLY_UNSUPPORTED or
+# TERMINOLOGY_TRANSFORMATION, using only the already-retrieved chunks.
+def validate_claims(
+    response_text: str,
+    retrieved_knowledge: list[tuple[dict, float]],
+    context_text: str,
+) -> list[dict]:
+    evidence_by_source: dict[str, str] = {}
+    for chunk, _ in retrieved_knowledge:
+        name = Path(chunk["source"]).name
+        evidence_by_source[name] = evidence_by_source.get(name, "") + "\n" + chunk["text"]
+    profiles = {
+        name: (
+            normalize_whitespace(text.lower()),
+            {word[:6] for word in re.findall(r"[a-z]{4,}", text.lower())},
+        )
+        for name, text in evidence_by_source.items()
+    }
+    normalized_lookup = {_normalize_source_name(name): name for name in evidence_by_source}
+
+    results = []
+    for claim in split_answer_into_claims(response_text):
+        cited: set[str] = set()
+        unknown: list[str] = []
+        citation_inners: list[str] = []
+        for inner in iter_parenthetical_text(claim):
+            if not DOC_HINT_PATTERN.search(inner):
+                continue
+            citation_inners.append(inner)
+            label = re.sub(r"(?i)^source\s*:\s*", "", inner.strip()).strip()
+            for part in re.split(r"\s*(?:&|,|\band\b)\s*", label):
+                if not part.strip():
+                    continue
+                source = normalized_lookup.get(_normalize_source_name(part))
+                if source:
+                    cited.add(source)
+                else:
+                    unknown.append(part.strip())
+        if not cited and not unknown:
+            # Same leniency as find_uncited_bullets: a retrieved filename mentioned outside parentheses counts.
+            normalized_claim = _normalize_source_name(claim)
+            cited = {source for norm, source in normalized_lookup.items() if norm and norm in normalized_claim}
+
+        body = claim
+        for inner in citation_inners:
+            body = body.replace(f"({inner})", " ")
+
+        status, detail = "SUPPORTED", ""
+        if not cited and not unknown:
+            if "source:" in claim.lower():
+                status, detail = "CITATION_MISMATCH", "citation does not name a retrieved source"
+            else:
+                status = "MISSING_CITATION"
+        elif unknown:
+            status, detail = "CITATION_MISMATCH", "cites a source that was not retrieved: " + ", ".join(unknown)
+        else:
+            expansions = find_unverified_acronym_expansions(body, context_text)
+            if expansions:
+                status, detail = "TERMINOLOGY_TRANSFORMATION", ", ".join(expansions)
+            else:
+                strong, content = _claim_terms(body)
+                cited_profile = (
+                    " ".join(profiles[source][0] for source in cited),
+                    set().union(*(profiles[source][1] for source in cited)),
+                )
+                missing, coverage = _evidence_overlap(strong, content, cited_profile)
+                if missing or coverage < CLAIM_SUPPORT_THRESHOLD:
+                    better = sorted(
+                        source
+                        for source in profiles
+                        if source not in cited
+                        and _evidence_overlap(strong, content, profiles[source])[0] == []
+                        and _evidence_overlap(strong, content, profiles[source])[1] >= CLAIM_SUPPORT_THRESHOLD
+                    )
+                    if better and (missing or coverage < CLAIM_MISMATCH_THRESHOLD):
+                        status, detail = "CITATION_MISMATCH", "evidence better matches " + ", ".join(better)
+                    else:
+                        status = "POSSIBLY_UNSUPPORTED"
+                        detail = (
+                            f"terms not found in cited evidence: {', '.join(missing)}"
+                            if missing
+                            else f"low overlap with cited evidence ({coverage:.0%})"
+                        )
+
+        results.append({"text": claim[:140], "status": status, "detail": detail})
+    return results
+
+
+# Runs every deterministic groundedness check over the finalized answer (before it is displayed)
+def run_groundedness_checks(
+    response_text: str,
+    valid_sources: set[str],
+    retrieved_knowledge: list[tuple[dict, float]],
+    context_text: str,
+) -> dict:
+    return {
+        "unverified_citations": find_unverified_citations(response_text, valid_sources),
+        "unverified_terms": find_unverified_regulatory_terms(response_text, context_text),
+        "unverified_acronyms": find_unverified_acronym_expansions(response_text, context_text),
+        "meta_knowledge_leaks": find_meta_knowledge_leaks(response_text),
+        "uncited_bullets": find_uncited_bullets(response_text, valid_sources),
+        "claims": validate_claims(response_text, retrieved_knowledge, context_text),
+    }
+
+
+# Turns check results into a categorized warning, or None if nothing was flagged
+def build_groundedness_warning(checks: dict) -> str | None:
+    def claims_with(status: str) -> list[dict]:
+        return [claim for claim in checks["claims"] if claim["status"] == status]
+
+    def examples(items: list[str]) -> str:
+        return " | ".join(list(dict.fromkeys(items))[:3])
+
+    missing = claims_with("MISSING_CITATION")
+    mismatched = claims_with("CITATION_MISMATCH")
+    unsupported = claims_with("POSSIBLY_UNSUPPORTED")
+    transformed = claims_with("TERMINOLOGY_TRANSFORMATION")
+
+    warning_lines = []
+    if missing or checks["uncited_bullets"]:
+        warning_lines.append("- Some statements are missing inline source citations.")
+        warning_lines.append(
+            "  Uncited: " + examples(checks["uncited_bullets"] + [claim["text"] for claim in missing])
+        )
+    if mismatched or checks["unverified_citations"]:
+        warning_lines.append("- One or more citations may not support the associated statement.")
+        if checks["unverified_citations"]:
+            warning_lines.append(
+                "  Cited file(s) not among the retrieved sources: " + ", ".join(checks["unverified_citations"])
+            )
+        if mismatched:
+            warning_lines.append(
+                "  " + examples([f"{claim['text']} ({claim['detail']})" for claim in mismatched])
+            )
+    if unsupported or checks["unverified_terms"] or checks["meta_knowledge_leaks"]:
+        warning_lines.append(
+            "- One or more statements could not be confidently verified against the retrieved evidence."
+        )
+        if checks["unverified_terms"]:
+            warning_lines.append(
+                "  Regulatory reference(s) not found verbatim in the uploaded documents: "
+                + ", ".join(checks["unverified_terms"])
+            )
+        if checks["meta_knowledge_leaks"]:
+            warning_lines.append(
+                "  Response appears to draw on the model's own training knowledge rather than the "
+                "uploaded documents: " + ", ".join(checks["meta_knowledge_leaks"])
+            )
+        if unsupported:
+            warning_lines.append(
+                "  " + examples([f"{claim['text']} ({claim['detail']})" for claim in unsupported])
+            )
+    if transformed or checks["unverified_acronyms"]:
+        warning_lines.append(
+            "- Some terminology may have been expanded or transformed beyond the wording in the retrieved evidence."
+        )
+        warning_lines.append(
+            "  " + examples(checks["unverified_acronyms"] + [claim["detail"] for claim in transformed])
+        )
+
+    if not warning_lines:
+        return None
+    return "\n".join(
+        ["Groundedness check flagged potential issues in this response:"]
+        + warning_lines
+        + ["Please verify these details manually before relying on them."]
+    )
 
 
 # Chat history persists across reruns so the full conversation stays visible, not just the latest answer.
@@ -1304,6 +1695,7 @@ if input_query and input_query.strip():
                 input_query,
                 available_sources=list(document_texts.keys()),
                 selected_sources=relevant_documents,
+                document_types=get_session_document_types(session_id),
             )
 
             try:
@@ -1508,115 +1900,60 @@ IMPORTANT REMINDER BEFORE YOU ANSWER
                             history_messages.append({"role": "user", "content": turn["question"]})
                             history_messages.append({"role": "assistant", "content": turn["answer"]})
 
-                    # Stream the answer token-by-token so it appears incrementally in the UI.
-                    stream = ollama.chat(
-                        model=LANGUAGE_MODEL,
-                        messages=[
-                            {"role": "system", "content": instruction_prompt},
-                            *history_messages,
-                            {"role": "user", "content": input_query},
-                        ],
-                        stream=True,
-                        options={"temperature": LLM_TEMPERATURE, "num_ctx": LLM_NUM_CTX},
-                    )
-
-                    response_box = st.empty()
-                    full_response = ""
-
-                    for chunk in stream:
-                        full_response += chunk["message"]["content"]
-                        response_box.write(strip_metadata_leakage(full_response))
-
-                    logger.info(
-                        "Response generated for query '%s' (%d chars).", input_query, len(full_response)
-                    )
-
-                    valid_sources = {
-                        Path(chunk["source"]).name for chunk, _ in retrieved_knowledge
-                    }
-                    # Post-processing: clean formatting, normalize citations, trim/deduplicate the answer.
-                    full_response = strip_metadata_leakage(full_response)
-                    full_response = normalize_inline_citations(full_response, valid_sources)
-                    full_response = add_missing_single_source_citations(full_response, valid_sources)
-                    full_response = strip_metadata_leakage(full_response)
-                    full_response = remove_repetitive_claims(full_response)
-                    full_response = normalize_answer_format(full_response)
-                    full_response = polish_final_answer(full_response)
-                    full_response = cap_claim_count(full_response, input_query)
-
-                    high_impact_notice = None
-                    if requires_safety_escalation(input_query, full_response, retrieved_knowledge):
-                        high_impact_notice = (
-                            "High-impact compliance topic detected. Verify with the appropriate owner before acting."
+                    # One non-streamed generation call: the answer is validated before anything is displayed.
+                    with st.spinner("Generating and verifying answer..."):
+                        response = ollama.chat(
+                            model=LANGUAGE_MODEL,
+                            messages=[
+                                {"role": "system", "content": instruction_prompt},
+                                *history_messages,
+                                {"role": "user", "content": input_query},
+                            ],
+                            options={"temperature": LLM_TEMPERATURE, "num_ctx": LLM_NUM_CTX},
                         )
+                        full_response = response["message"]["content"]
+
+                        logger.info(
+                            "Response generated for query '%s' (%d chars).", input_query, len(full_response)
+                        )
+
+                        valid_sources = {
+                            Path(chunk["source"]).name for chunk, _ in retrieved_knowledge
+                        }
+                        full_response = finalize_answer_text(full_response, valid_sources, input_query)
+
+                        high_impact_notice = None
+                        if requires_safety_escalation(input_query, full_response, retrieved_knowledge):
+                            high_impact_notice = (
+                                "High-impact compliance topic detected. Verify with the appropriate owner before acting."
+                            )
+
+                        # Deterministic groundedness checks on the answer body (before the footer is appended).
+                        checks = run_groundedness_checks(
+                            full_response, valid_sources, retrieved_knowledge, context_block
+                        )
+                        groundedness_warning = build_groundedness_warning(checks)
+                        if groundedness_warning:
+                            logger.warning(
+                                "Groundedness check failed for query '%s': citations=%s terms=%s acronyms=%s leaks=%s uncited=%s claims=%s",
+                                input_query, checks["unverified_citations"], checks["unverified_terms"],
+                                checks["unverified_acronyms"], checks["meta_knowledge_leaks"],
+                                checks["uncited_bullets"],
+                                [(claim["status"], claim["text"]) for claim in checks["claims"] if claim["status"] != "SUPPORTED"],
+                            )
 
                     # Appended deterministically — the model previously paraphrased this and invented extra sources.
                     elapsed_seconds = time.perf_counter() - response_started_at
-                    full_response = normalize_answer_format(
-                        remove_repetitive_claims(strip_metadata_leakage(full_response))
-                    ).rstrip()
-                    full_response = polish_final_answer(full_response)
-                    full_response = add_missing_single_source_citations(full_response, valid_sources)
-                    full_response = polish_final_answer(full_response)
-                    full_response = cap_claim_count(full_response, input_query)
                     full_response = (
                         full_response
                         + f"\n\nSources consulted: {sources_consulted}"
                         + f"\n\nAudit: retrieved {len(retrieved_knowledge)} evidence chunk(s) in this answer; "
                         + f"generation time {elapsed_seconds:.1f}s; app version {APP_VERSION}."
                     )
-                    response_box.write(full_response)
+                    st.write(full_response)
                     if high_impact_notice:
                         st.caption(high_impact_notice)
-
-                    # Run groundedness checks and surface issues as a visible warning.
-                    unverified_citations = find_unverified_citations(full_response, valid_sources)
-                    unverified_terms = find_unverified_regulatory_terms(full_response, context_block)
-                    unverified_acronyms = find_unverified_acronym_expansions(full_response, context_block)
-                    meta_knowledge_leaks = find_meta_knowledge_leaks(full_response)
-                    uncited_bullets = find_uncited_bullets(full_response, valid_sources)
-
-                    groundedness_warning = None
-                    if (
-                        unverified_citations
-                        or unverified_terms
-                        or unverified_acronyms
-                        or meta_knowledge_leaks
-                        or uncited_bullets
-                    ):
-                        warning_lines = ["Groundedness check flagged potential issues in this response:"]
-                        if unverified_citations:
-                            warning_lines.append(
-                                "- Cited file(s) not among the retrieved sources: "
-                                + ", ".join(unverified_citations)
-                            )
-                        if unverified_terms:
-                            warning_lines.append(
-                                "- Regulatory reference(s) not found verbatim in the uploaded documents: "
-                                + ", ".join(unverified_terms)
-                            )
-                        if meta_knowledge_leaks:
-                            warning_lines.append(
-                                "- Response appears to draw on the model's own training knowledge "
-                                "rather than the uploaded documents: " + ", ".join(meta_knowledge_leaks)
-                            )
-                        if unverified_acronyms:
-                            warning_lines.append(
-                                "- Acronym(s) expanded in the answer but not spelled out verbatim "
-                                "in the uploaded documents: " + ", ".join(unverified_acronyms)
-                            )
-                        if uncited_bullets:
-                            warning_lines.append(
-                                "- Bullet(s) missing inline source citations: "
-                                + " | ".join(uncited_bullets[:3])
-                            )
-                        warning_lines.append("Please verify these details manually before relying on them.")
-                        groundedness_warning = "\n".join(warning_lines)
-                        logger.warning(
-                            "Groundedness check failed for query '%s': citations=%s terms=%s acronyms=%s leaks=%s uncited=%s",
-                            input_query, unverified_citations, unverified_terms, unverified_acronyms,
-                            meta_knowledge_leaks, uncited_bullets,
-                        )
+                    if groundedness_warning:
                         st.warning(groundedness_warning)
 
                     render_retrieved_context(retrieved_knowledge)
