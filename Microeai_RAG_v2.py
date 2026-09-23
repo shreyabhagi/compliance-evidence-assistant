@@ -48,7 +48,7 @@ LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.1"))
 # 4096-token default context overflows with chat history + retrieved chunks and corrupts output; 6144 gives headroom.
 LLM_NUM_CTX = int(os.environ.get("LLM_NUM_CTX", "6144"))
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 # Terms that trigger the "verify with the appropriate owner" high-impact notice (see requires_safety_escalation).
 SAFETY_ESCALATION_TERMS = (
     "adverse event",
@@ -627,6 +627,16 @@ def get_session_document_types(session_id: str) -> dict[str, str]:
         return {}
 
 
+# Sources in this session whose indexing finished (index_status == COMPLETE). Metadata lookup only.
+# Chunks of PENDING/FAILED documents stay stored for recovery but are never exposed as answer evidence.
+def get_complete_sources(session_id: str) -> list[str]:
+    result = docs_collection.get(
+        where={"$and": [{"session_id": session_id}, {"index_status": "COMPLETE"}]},
+        include=["metadatas"],
+    )
+    return [meta["source"] for meta in result["metadatas"] if meta]
+
+
 # Deletes a document and all its chunks from ChromaDB
 def clear_document_from_index(source_name: str, session_id: str) -> None:
     doc_id = f"{session_id}::{source_name}"
@@ -815,10 +825,11 @@ def choose_relevant_documents(
     threshold: float = DOC_SELECT_THRESHOLD,
     query_embedding: list[float] | None = None,
 ) -> list[str]:
-    session_docs = docs_collection.get(where={"session_id": session_id}, include=[])
+    complete_filter = {"$and": [{"session_id": session_id}, {"index_status": "COMPLETE"}]}
+    session_docs = docs_collection.get(where=complete_filter, include=[])
     total_docs = len(session_docs["ids"])
     if total_docs == 0:
-        logger.warning("No documents indexed for session '%s'.", session_id)
+        logger.warning("No completely indexed documents for session '%s'.", session_id)
         return []
 
     if query_embedding is None:
@@ -832,7 +843,7 @@ def choose_relevant_documents(
         results = docs_collection.query(
             query_embeddings=[query_embedding],
             n_results=min(top_n, total_docs),
-            where={"session_id": session_id},
+            where=complete_filter,
             include=["metadatas", "distances"],
         )
     except Exception as e:
@@ -861,7 +872,19 @@ def retrieve(
     query_embedding: list[float] | None = None,
 ) -> list[tuple[dict, float]]:
     # Finds the top_n most relevant chunks: search, then re-rank, then remove duplicates/spread across documents
-    session_chunks = chunks_collection.get(where={"session_id": session_id}, include=[])
+    # Only COMPLETE documents are eligible; requested source_filters are intersected with them.
+    complete_sources = get_complete_sources(session_id)
+    allowed_sources = (
+        [source for source in source_filters if source in set(complete_sources)]
+        if source_filters
+        else complete_sources
+    )
+    if not allowed_sources:
+        logger.warning("No completely indexed documents available for retrieval in session '%s'.", session_id)
+        return []
+    where_filter = {"$and": [{"session_id": session_id}, {"source": {"$in": allowed_sources}}]}
+
+    session_chunks = chunks_collection.get(where=where_filter, include=[])
     total_chunks = len(session_chunks["ids"])
     if total_chunks == 0:
         logger.warning("No chunks indexed for session '%s'.", session_id)
@@ -873,12 +896,6 @@ def retrieve(
         except Exception as e:
             logger.error("Failed to embed query for retrieval: %s", e)
             raise
-
-    where_filter = (
-        {"$and": [{"session_id": session_id}, {"source": {"$in": list(source_filters)}}]}
-        if source_filters
-        else {"session_id": session_id}
-    )
 
     try:
         results = chunks_collection.query(
@@ -1370,6 +1387,9 @@ def finalize_answer_text(response_text: str, valid_sources: set[str], query: str
 # vector search. Lexical overlap is a cheap signal for obvious unsupported content, not proof of entailment.
 CLAIM_SUPPORT_THRESHOLD = 0.5    # Share of a claim's content words found in cited evidence to accept it.
 CLAIM_MISMATCH_THRESHOLD = 0.25  # Below this, the cited evidence is treated as unrelated to the claim.
+# Stricter bar for automatically ADDING a citation: 0.5 overlap can be met by generic words alone
+# ("participant developed ...") while the key finding differs.
+CITATION_REPAIR_THRESHOLD = 0.8
 CLAIM_STOPWORDS = frozenset({
     "that", "this", "with", "from", "were", "have", "been", "which", "their", "there", "they", "will",
     "would", "should", "shall", "must", "also", "into", "than", "then", "when", "where", "what", "such",
@@ -1457,6 +1477,21 @@ def _evidence_overlap(strong: set[str], content: set[str], profile: tuple[str, s
     return missing, coverage
 
 
+# Per-source evidence profile (normalized lowercase text, content-word stems) from the retrieved chunks
+def _evidence_profiles(retrieved_knowledge: list[tuple[dict, float]]) -> dict[str, tuple[str, set[str]]]:
+    evidence_by_source: dict[str, str] = {}
+    for chunk, _ in retrieved_knowledge:
+        name = Path(chunk["source"]).name
+        evidence_by_source[name] = evidence_by_source.get(name, "") + "\n" + chunk["text"]
+    return {
+        name: (
+            normalize_whitespace(text.lower()),
+            {word[:6] for word in re.findall(r"[a-z]{4,}", text.lower())},
+        )
+        for name, text in evidence_by_source.items()
+    }
+
+
 # Classifies each claim as SUPPORTED, MISSING_CITATION, CITATION_MISMATCH, POSSIBLY_UNSUPPORTED or
 # TERMINOLOGY_TRANSFORMATION, using only the already-retrieved chunks.
 def validate_claims(
@@ -1464,18 +1499,8 @@ def validate_claims(
     retrieved_knowledge: list[tuple[dict, float]],
     context_text: str,
 ) -> list[dict]:
-    evidence_by_source: dict[str, str] = {}
-    for chunk, _ in retrieved_knowledge:
-        name = Path(chunk["source"]).name
-        evidence_by_source[name] = evidence_by_source.get(name, "") + "\n" + chunk["text"]
-    profiles = {
-        name: (
-            normalize_whitespace(text.lower()),
-            {word[:6] for word in re.findall(r"[a-z]{4,}", text.lower())},
-        )
-        for name, text in evidence_by_source.items()
-    }
-    normalized_lookup = {_normalize_source_name(name): name for name in evidence_by_source}
+    profiles = _evidence_profiles(retrieved_knowledge)
+    normalized_lookup = {_normalize_source_name(name): name for name in profiles}
 
     results = []
     for claim in split_answer_into_claims(response_text):
@@ -1543,6 +1568,99 @@ def validate_claims(
 
         results.append({"text": claim[:140], "status": status, "detail": detail})
     return results
+
+
+# Safe citation repair: adds "(Source: X)" to an uncited single-line claim ONLY when exactly one retrieved
+# source contains all of the claim's numbers/IDs/acronyms and >= CITATION_REPAIR_THRESHOLD of its content
+# words. Claims with unsupported regulatory terms, acronym expansions or meta-knowledge are never cited.
+# Having only one retrieved source is never sufficient on its own. Uses in-memory evidence only.
+def repair_safe_missing_citations(
+    response_text: str,
+    retrieved_knowledge: list[tuple[dict, float]],
+    context_text: str,
+) -> str:
+    profiles = _evidence_profiles(retrieved_knowledge)
+    single_line_claims = set(split_answer_into_claims(response_text))
+    lines = response_text.splitlines()
+
+    for index, line in enumerate(lines):
+        claim = line.strip()
+        if claim not in single_line_claims:
+            continue  # not a claim, or part of a multi-line bullet (left for the validator to flag)
+        if validate_claims(claim, retrieved_knowledge, context_text)[0]["status"] != "MISSING_CITATION":
+            continue
+        if (
+            find_unverified_acronym_expansions(claim, context_text)
+            or find_unverified_regulatory_terms(claim, context_text)
+            or find_meta_knowledge_leaks(claim)
+        ):
+            continue
+
+        strong, content = _claim_terms(claim)
+        if not content:
+            continue
+        qualifying = []
+        for source, profile in profiles.items():
+            missing, coverage = _evidence_overlap(strong, content, profile)
+            if not missing and coverage >= CITATION_REPAIR_THRESHOLD:
+                qualifying.append(source)
+        if len(qualifying) == 1:  # zero = unsupported, several = ambiguous attribution: do not guess
+            lines[index] = f"{line.rstrip()} (Source: {qualifying[0]})"
+            logger.info("Repaired missing citation -> %s: %s", qualifying[0], claim[:100])
+
+    return "\n".join(lines)
+
+
+# Safe terminology repair for the narrow pattern "Expanded Phrase (ACRONYM)": when the acronym is in the
+# retrieved evidence, the expansion is not, and the expansion detector flags it, the phrase is replaced by
+# the bare acronym (e.g. "Common Terminology Criteria for Adverse Events (CTCAE)" -> "CTCAE").
+# Anything that cannot be mechanically reversed (other layouts, non-initialism acronyms) is left unchanged.
+def repair_unsupported_acronym_expansions(response_text: str, context_text: str) -> str:
+    context_lower = normalize_whitespace(context_text.lower())
+    repaired = response_text
+
+    for match in reversed(list(re.finditer(r"\(([A-Z]{2,6})\)", response_text))):
+        acronym = match.group(1)
+        if not re.search(rf"\b{acronym}\b", context_text):
+            continue
+
+        # Walk back over the capitalized words (plus connectors) directly before "(ACRONYM)".
+        preceding = response_text[:match.start()].rstrip()
+        tokens = list(re.finditer(r"[A-Za-z]+|[^A-Za-z\s]", preceding))
+        significant: list[str] = []
+        phrase_start = None
+        position = len(tokens) - 1
+        while position >= 0 and len(significant) < len(acronym):
+            word = tokens[position].group(0)
+            if word.isalpha() and word[0].isupper():
+                significant.append(word)
+                phrase_start = tokens[position].start()
+            elif not (significant and word.lower() in ACRONYM_CONNECTOR_WORDS):
+                break
+            position -= 1
+        if phrase_start is None or "".join(word[0] for word in reversed(significant)).upper() != acronym:
+            continue
+
+        phrase = preceding[phrase_start:]
+        if normalize_whitespace(phrase.lower()) in context_lower:
+            continue  # supported expansion: keep it
+        if not any(f"(as {acronym})" in flagged for flagged in find_unverified_acronym_expansions(phrase, context_text)):
+            continue
+        repaired = repaired[:phrase_start] + acronym + repaired[match.end():]
+        logger.info("Removed unsupported acronym expansion: %s (%s)", phrase, acronym)
+
+    return repaired
+
+
+# Only mechanically safe repairs; POSSIBLY_UNSUPPORTED, CITATION_MISMATCH, unknown sources, regulatory
+# references and meta-knowledge leaks are never repaired and keep their warnings.
+def apply_safe_repairs(
+    response_text: str,
+    retrieved_knowledge: list[tuple[dict, float]],
+    context_text: str,
+) -> str:
+    repaired = repair_unsupported_acronym_expansions(response_text, context_text)
+    return repair_safe_missing_citations(repaired, retrieved_knowledge, context_text)
 
 
 # Runs every deterministic groundedness check over the finalized answer (before it is displayed)
@@ -1888,6 +2006,10 @@ IMPORTANT REMINDER BEFORE YOU ANSWER
 - If in doubt, say so and recommend expert consultation.
 - Before writing your answer, re-read every excerpt block in the context above
   and answer with the most relevant distinct points only.
+- Before returning your answer, inspect every factual bullet. Every factual bullet
+  must end with at least one exact inline citation in the format (Source: filename.docx).
+  If a bullet cannot be cited from the provided excerpts, remove that bullet. Do not
+  expand an acronym unless its full expansion appears verbatim in the provided excerpts.
 '''
 
             with st.chat_message("assistant"):
@@ -1922,16 +2044,28 @@ IMPORTANT REMINDER BEFORE YOU ANSWER
                         }
                         full_response = finalize_answer_text(full_response, valid_sources, input_query)
 
+                        # Validate -> safe deterministic repair -> re-validate, all on the answer body
+                        # (before the footer is appended). The warning reflects the text actually displayed.
+                        checks = run_groundedness_checks(
+                            full_response, valid_sources, retrieved_knowledge, context_block
+                        )
+                        repaired_response = apply_safe_repairs(full_response, retrieved_knowledge, context_block)
+                        if repaired_response != full_response:
+                            logger.info(
+                                "Applied safe repairs for query '%s'; pre-repair claim statuses: %s",
+                                input_query, [claim["status"] for claim in checks["claims"]],
+                            )
+                            full_response = repaired_response
+                            checks = run_groundedness_checks(
+                                full_response, valid_sources, retrieved_knowledge, context_block
+                            )
+
                         high_impact_notice = None
                         if requires_safety_escalation(input_query, full_response, retrieved_knowledge):
                             high_impact_notice = (
                                 "High-impact compliance topic detected. Verify with the appropriate owner before acting."
                             )
 
-                        # Deterministic groundedness checks on the answer body (before the footer is appended).
-                        checks = run_groundedness_checks(
-                            full_response, valid_sources, retrieved_knowledge, context_block
-                        )
                         groundedness_warning = build_groundedness_warning(checks)
                         if groundedness_warning:
                             logger.warning(
